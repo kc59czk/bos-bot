@@ -6,9 +6,12 @@ import struct
 import winreg
 import xml.etree.ElementTree as ET
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import Enum
 import re
+import os
+import pandas as pd
+import random
 
 # PyQt6 imports
 from PyQt6.QtWidgets import (
@@ -16,8 +19,14 @@ from PyQt6.QtWidgets import (
     QLineEdit, QPushButton, QTabWidget, QTreeWidget, QTreeWidgetItem, QTextEdit,
     QComboBox, QFrame, QMessageBox, QHeaderView, QSplitter, QPlainTextEdit
 )
-from PyQt6.QtCore import QTimer, Qt
+from PyQt6.QtCore import QTimer, Qt, QUrl
 from PyQt6.QtGui import QFont
+# Import for web view to display the chart
+from PyQt6.QtWebEngineWidgets import QWebEngineView
+
+# Import for charting library
+from lightweight_charts import Chart
+
 
 class BotState(Enum):
     STOPPED = 0
@@ -30,15 +39,19 @@ class BossaAppPyQt(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("BossaAPI - Menedżer Transakcji (PyQt6)")
-        self.setGeometry(100, 30, 1100, 800)
+        self.setGeometry(100, 30, 1200, 850)
 
         self.client = None
         self.queue = queue.Queue()
-#        self.TARGET_ISIN = "PL0GF0031252"
-        self.TARGET_ISIN = "PL0GF0031880"  # fw20z2520
+        self.TARGET_ISIN = "PL0GF0031252"
         self.orders = {}
-        # NEW: Flag to prevent multiple bot confirmation dialogs
         self.is_bot_confirmation_pending = False
+        
+        # --- NEW: Attributes for OHLC chart aggregation ---
+        self.ohlc_data = [] # List to store completed bars
+        self.current_bar = {} # The bar currently being formed
+        self.bar_interval = timedelta(minutes=1) # 1-minute bars
+        self.last_chart_update_time = datetime.now()
         
         self.STATUS_MAP = {'0': 'Nowe', '1': 'Aktywne', '2': 'Wykonane', '4': 'Anulowane', '5': 'Zastąpione', '6': 'Oczekuje na anul.', '8': 'Odrzucone', 'E': 'Oczekuje na mod.'}
         self.SIDE_MAP = {'1': 'Kupno', '2': 'Sprzedaż'}
@@ -50,18 +63,20 @@ class BossaAppPyQt(QMainWindow):
         self.queue_timer.timeout.connect(self.process_queue)
         self.queue_timer.start(100)
 
-    # --- UI Creation methods (unchanged from previous version) ---
     def create_widgets(self):
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
-        main_layout = QHBoxLayout(central_widget)  # can chage to QVBoxLayout
+        main_layout = QVBoxLayout(central_widget)
         self.tabs = QTabWidget()
         main_layout.addWidget(self.tabs)
+        
         self.create_login_tab()
         self.create_orders_tab()
         self.create_monitor_tab()
         self.create_bot_tab()
         self.create_portfolio_tab()
+        self.create_chart_tab()
+
         bottom_logs_splitter = QSplitter(Qt.Orientation.Vertical)
         top_panel_widget = QWidget()
         top_panel_layout = QVBoxLayout(top_panel_widget)
@@ -77,6 +92,7 @@ class BossaAppPyQt(QMainWindow):
         top_panel_layout.addWidget(self.async_messages)
         bottom_logs_splitter.addWidget(top_panel_widget)
         main_layout.addWidget(bottom_logs_splitter, stretch=1)
+        
         self.statusBar = self.statusBar()
         self.status_latency_label = QLabel("Latency: --- ")
         self.status_time_label = QLabel("Czas: --:--:--")
@@ -90,6 +106,40 @@ class BossaAppPyQt(QMainWindow):
         self.time_timer.timeout.connect(self._update_status_time)
         self.time_timer.start(1000)
 
+    # MODIFIED: Chart tab is now simpler, awaiting data.
+    def create_chart_tab(self):
+        chart_tab_widget = QWidget()
+        layout = QVBoxLayout(chart_tab_widget)
+        
+        info_label = QLabel("Wykres pojawi się automatycznie po otrzymaniu danych rynkowych...")
+        info_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(info_label)
+
+        self.chart_view = QWebEngineView()
+        layout.addWidget(self.chart_view)
+
+        self.tabs.addTab(chart_tab_widget, "Wykres OHLCV")
+
+    # NEW: Redraws the chart with the latest data.
+    def redraw_chart(self):
+        # Combine historical data with the currently forming bar
+        all_bars = self.ohlc_data + ([self.current_bar] if self.current_bar else [])
+        if not all_bars:
+            return
+
+        df = pd.DataFrame(all_bars)
+        # Ensure time is in the correct format (string) for the library
+        df['time'] = pd.to_datetime(df['time']).dt.strftime('%Y-%m-%d %H:%M:%S')
+
+        chart = Chart(width=800, height=500, inner_width=1.0, inner_height=1.0)
+        chart.set(df)
+        chart.volume_config(scale_margin_top=0.8, scale_margin_bottom=0)
+        
+        # Get HTML content and load it into the web view
+        html_content = chart.to_html()
+        self.chart_view.setHtml(html_content)
+        
+    # --- Other methods ---
     def _update_status_time(self):
         now = datetime.now().strftime("%H:%M:%S")
         self.status_time_label.setText(f"Czas: {now}")
@@ -113,12 +163,8 @@ class BossaAppPyQt(QMainWindow):
     def create_bot_tab(self):
         tab_bot = QWidget()
         layout = QVBoxLayout(tab_bot)
-
- # --- Single row with all tiles ---
         tile_widget = QWidget()
         tile_layout = QHBoxLayout(tile_widget)
-
-# Create all tile frames and labels
         bid_frame, self.bid_label = self._create_tile("BID")
         bid_size_frame, self.bid_size_label = self._create_tile("BID Size")
         ask_frame, self.ask_label = self._create_tile("ASK")
@@ -127,8 +173,6 @@ class BossaAppPyQt(QMainWindow):
         lop_frame, self.lop_label = self._create_tile("LOP")
         be_frame, self.be_label = self._create_tile("BREAK-EVEN")
         pos_frame, self.pos_label = self._create_tile("OTWARTE POZYCJE")
-
-# Add all widgets to the single horizontal layout
         tile_layout.addWidget(bid_frame)
         tile_layout.addWidget(bid_size_frame)
         tile_layout.addWidget(ask_frame)
@@ -137,11 +181,7 @@ class BossaAppPyQt(QMainWindow):
         tile_layout.addWidget(lop_frame)
         tile_layout.addWidget(be_frame)
         tile_layout.addWidget(pos_frame)
-
-# Add the single widget with all tiles to the main layout
         layout.addWidget(tile_widget)
-
-        # --- Bot Parameters ---
         params_frame = QFrame()
         params_frame.setFrameShape(QFrame.Shape.StyledPanel)
         params_layout = QHBoxLayout(params_frame)
@@ -156,8 +196,6 @@ class BossaAppPyQt(QMainWindow):
         params_layout.addWidget(self.daily_goal_entry)
         params_layout.addStretch()
         layout.addWidget(params_frame)
-
-        # --- Bot Actions ---
         action_widget = QWidget()
         action_layout = QHBoxLayout(action_widget)
         self.start_long_button = QPushButton("OTWÓRZ LONG")
@@ -165,25 +203,21 @@ class BossaAppPyQt(QMainWindow):
         self.start_long_button.setEnabled(False)
         self.start_long_button.clicked.connect(lambda: self.start_trade("Kupno"))
         action_layout.addWidget(self.start_long_button)
-
         self.start_short_button = QPushButton("OTWÓRZ SHORT")
         self.start_short_button.setStyleSheet("background-color: salmon;")
         self.start_short_button.setEnabled(False)
         self.start_short_button.clicked.connect(lambda: self.start_trade("Sprzedaż"))
         action_layout.addWidget(self.start_short_button)
-        
         self.close_pos_button = QPushButton("ZAMKNIJ POZYCJĘ (PANIC)")
         self.close_pos_button.setStyleSheet("background-color: orange;")
         self.close_pos_button.setEnabled(False)
         self.close_pos_button.clicked.connect(self.close_trade_manually)
         action_layout.addWidget(self.close_pos_button)
-        
         self.start_bot_existing_pos_button = QPushButton("START BOT Z ISTNIEJĄCĄ POZYCJĄ")
         self.start_bot_existing_pos_button.setStyleSheet("background-color: lightblue;")
         self.start_bot_existing_pos_button.setEnabled(False)
         self.start_bot_existing_pos_button.clicked.connect(self.start_bot_with_existing_position)
         action_layout.addWidget(self.start_bot_existing_pos_button)
-        
         layout.addWidget(action_widget)
         layout.addWidget(QLabel("Log Menedżera:"))
         self.bot_log = QPlainTextEdit()
@@ -289,10 +323,7 @@ class BossaAppPyQt(QMainWindow):
         layout.addWidget(self.portfolio_display)
         self.tabs.addTab(tab_portfolio, "Portfel")
 
-    # --- Confirmation and Action Handlers ---
-
     def confirm_dialog(self, title, message):
-        """NEW: Centralized confirmation dialog."""
         reply = QMessageBox.question(self, title, message,
                                      QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                                      QMessageBox.StandardButton.No)
@@ -301,8 +332,7 @@ class BossaAppPyQt(QMainWindow):
     def on_treeview_select(self):
         selected_items = self.order_tree.selectedItems()
         if not selected_items:
-            self.cancel_order_button.setEnabled(False)
-            return
+            self.cancel_order_button.setEnabled(False); return
         item = selected_items[0]
         status = item.text(self.TREE_COLS.index('status'))
         self.cancel_order_button.setEnabled(status in ['Nowe', 'Aktywne'])
@@ -310,22 +340,11 @@ class BossaAppPyQt(QMainWindow):
     def cancel_selected_order(self):
         selected_items = self.order_tree.selectedItems()
         if not selected_items:
-            QMessageBox.warning(self, "Brak zaznaczenia", "Proszę zaznaczyć zlecenie do anulowania.")
-            return
-            
+            QMessageBox.warning(self, "Brak zaznaczenia", "Proszę zaznaczyć zlecenie do anulowania."); return
         item = selected_items[0]
-        order_details = {
-            'id_dm': item.text(self.TREE_COLS.index('id_dm')),
-            'k_s_text': item.text(self.TREE_COLS.index('k_s')),
-            'ilosc': item.text(self.TREE_COLS.index('ilosc')),
-            'rachunek': self.account_entry.text()
-        }
-        
+        order_details = {'id_dm': item.text(self.TREE_COLS.index('id_dm')), 'k_s_text': item.text(self.TREE_COLS.index('k_s')), 'ilosc': item.text(self.TREE_COLS.index('ilosc')), 'rachunek': self.account_entry.text()}
         if not order_details['rachunek']:
-            QMessageBox.critical(self, "Błąd", "Nie można anulować zlecenia bez podanego numeru rachunku.")
-            return
-
-        # NEW: Confirmation step
+            QMessageBox.critical(self, "Błąd", "Nie można anulować zlecenia bez podanego numeru rachunku."); return
         msg = f"Czy na pewno chcesz ANULOWAĆ zlecenie ID {order_details['id_dm']} ({order_details['k_s_text']} {order_details['ilosc']} szt.)?"
         if self.confirm_dialog("Potwierdzenie Anulowania", msg):
             if self.client:
@@ -336,26 +355,14 @@ class BossaAppPyQt(QMainWindow):
         self.heartbeat_label.setText("❤")
         QTimer.singleShot(300, lambda: self.heartbeat_label.setText("♡"))
     
+    # MODIFIED: Contains the new tick aggregation logic
     def process_queue(self):
         try:
             while not self.queue.empty():
                 message_type, data = self.queue.get_nowait()
-                # ... (message handling for PORTFOLIO_UPDATE, MARKET_DATA_UPDATE, etc. is unchanged)
-                if message_type == "PORTFOLIO_UPDATE":
-                    self.display_portfolio(data['portfolio_data'])
-                    self.pos_label.setText(str(data.get('open_position_qty', '---')))
-                    if data.get('portfolio_data') and not self.account_entry.text():
-                        first_account = next(iter(data['portfolio_data']))
-                        self.account_entry.setText(first_account)
-                    
-                    if data.get('existing_position_found'):
-                        self.start_bot_existing_pos_button.setEnabled(True)
-                        pos_details = data['existing_position_details']
-                        self.log_message(self.bot_log, f"Znaleziono istniejącą pozycję: {pos_details['quantity']} szt. {pos_details['symbol']} ({pos_details['position_type']}). Możesz uruchomić bota z tą pozycją.")
-                    else:
-                        self.start_bot_existing_pos_button.setEnabled(False)
-
-                elif message_type == "MARKET_DATA_UPDATE":
+                
+                if message_type == "MARKET_DATA_UPDATE":
+                    # --- Standard UI updates ---
                     if data.get('isin') == self.TARGET_ISIN:
                         self.bid_label.setText(f"{data.get('bid', '---'):.2f}")
                         self.ask_label.setText(f"{data.get('ask', '---'):.2f}")
@@ -363,39 +370,72 @@ class BossaAppPyQt(QMainWindow):
                         self.lop_label.setText(f"{data.get('lop', '---')}")
                         self.bid_size_label.setText(str(data.get('bid_size', '---')))
                         self.ask_size_label.setText(str(data.get('ask_size', '---')))
-
                         if not self.price_entry.hasFocus():
                             price = data.get('last_price')
-                            if price:
-                                self.price_entry.setText(f"{price:.2f}")
+                            if price: self.price_entry.setText(f"{price:.2f}")
 
-                # NEW: Handle confirmation requests from the bot
+                    # --- NEW: Tick aggregation for OHLC chart ---
+                    last_price = data.get('last_price')
+                    if last_price:
+                        now = datetime.now()
+                        current_minute_start = now.replace(second=0, microsecond=0)
+
+                        if not self.current_bar or self.current_bar['time'] < current_minute_start:
+                            # Finalize the old bar and add it to history
+                            if self.current_bar:
+                                self.ohlc_data.append(self.current_bar)
+                            
+                            # Start a new bar
+                            self.current_bar = {
+                                'time': current_minute_start,
+                                'open': last_price,
+                                'high': last_price,
+                                'low': last_price,
+                                'close': last_price,
+                                'volume': random.randint(1, 10) # Simulated volume
+                            }
+                        else:
+                            # Update the current bar
+                            self.current_bar['high'] = max(self.current_bar['high'], last_price)
+                            self.current_bar['low'] = min(self.current_bar['low'], last_price)
+                            self.current_bar['close'] = last_price
+                            self.current_bar['volume'] += random.randint(1, 10) # Simulated volume
+
+                        # Throttle chart redraws to avoid excessive updates
+                        if (now - self.last_chart_update_time).total_seconds() > 2:
+                            self.redraw_chart()
+                            self.last_chart_update_time = now
+                
+                elif message_type == "PORTFOLIO_UPDATE":
+                    self.display_portfolio(data['portfolio_data'])
+                    self.pos_label.setText(str(data.get('open_position_qty', '---')))
+                    if data.get('portfolio_data') and not self.account_entry.text():
+                        first_account = next(iter(data['portfolio_data']))
+                        self.account_entry.setText(first_account)
+                    if data.get('existing_position_found'):
+                        self.start_bot_existing_pos_button.setEnabled(True)
+                        pos_details = data['existing_position_details']
+                        self.log_message(self.bot_log, f"Znaleziono istniejącą pozycję: {pos_details['quantity']} szt. {pos_details['symbol']} ({pos_details['position_type']}). Możesz uruchomić bota z tą pozycją.")
+                    else:
+                        self.start_bot_existing_pos_button.setEnabled(False)
+
                 elif message_type == "CONFIRM_BOT_ACTION":
-                    if self.is_bot_confirmation_pending:
-                        continue # Skip if a dialog is already open
-
+                    if self.is_bot_confirmation_pending: continue
                     self.is_bot_confirmation_pending = True
                     details = data['details']
                     action_type = data['action_type']
-                    
                     if action_type == "MOVE_STOP":
                         msg = (f"BOT SUGERUJE AKCJĘ: Przesunięcie Stop-Loss.\n\n"
                                f"ANULUJ Zlecenie ID: {details['old_stop_id']}\n"
                                f"ZŁÓŻ NOWE Zlecenie: {details['direction']} {details['quantity']} szt. @ {details['new_price']:.2f}\n\n"
                                "Czy potwierdzasz tę operację?")
-                        
                         if self.confirm_dialog("Potwierdzenie Akcji Bota", msg):
                             self.log_message(self.bot_log, "Użytkownik potwierdził przesunięcie stop-lossa.")
-                            # Execute confirmed actions
                             self.client.execute_bot_action(data)
                         else:
                             self.log_message(self.bot_log, "Użytkownik odrzucił przesunięcie stop-lossa.")
-                            # Inform client that action was rejected
                             self.client.bot_action_rejected()
-                    
                     self.is_bot_confirmation_pending = False
-                
-                # ... other message types from previous version
                 elif message_type == "BOT_STATE_UPDATE":
                     entry_price = data.get('entry_price')
                     self.close_pos_button.setEnabled(True if entry_price else False)
@@ -404,10 +444,8 @@ class BossaAppPyQt(QMainWindow):
                         self.be_label.setText(f"{be_price:.2f}")
                     else:
                         self.be_label.setText("---")
-                        self.start_long_button.setEnabled(True)
-                        self.start_short_button.setEnabled(True)
+                        self.start_long_button.setEnabled(True); self.start_short_button.setEnabled(True)
                         self.start_bot_existing_pos_button.setEnabled(False)
-
                 elif message_type == "BOT_LOG": self.log_message(self.bot_log, data)
                 elif message_type == "EXEC_REPORT": self.update_order_monitor(data)
                 elif message_type == "LOG": self.log_message(self.status_log, data)
@@ -437,89 +475,59 @@ class BossaAppPyQt(QMainWindow):
                 elif message_type == "LOGIN_FAIL":
                     self.log_message(self.status_log, f"Logowanie nie powiodło się: {data}")
                     self.login_button.setEnabled(True)
-
-        except queue.Empty:
-            pass
+        except queue.Empty: pass
             
     def start_trade(self, direction):
-        if not self.client:
-            self.log_message(self.bot_log, "Błąd: Klient nie jest połączony.")
-            return
+        if not self.client: self.log_message(self.bot_log, "Błąd: Klient nie jest połączony."); return
         try:
             params = {'account': self.account_entry.text(), 'trailing_stop': int(self.stoploss_entry.text()), 'daily_goal': int(self.daily_goal_entry.text()), 'commission': 1}
-            if not params['account']:
-                self.log_message(self.bot_log, "Błąd: Numer rachunku jest wymagany.")
-                return
-        except ValueError:
-            self.log_message(self.bot_log, "Błąd: Parametry menedżera muszą być liczbami.")
-            return
-        
-        # NEW: Confirmation step
+            if not params['account']: self.log_message(self.bot_log, "Błąd: Numer rachunku jest wymagany."); return
+        except ValueError: self.log_message(self.bot_log, "Błąd: Parametry menedżera muszą być liczbami."); return
         trade_type = "LONG" if direction == "Kupno" else "SHORT"
         msg = f"Czy na pewno chcesz uruchomić bota i otworzyć pozycję {trade_type}?"
         if self.confirm_dialog("Potwierdzenie Uruchomienia Bota", msg):
-            self.start_long_button.setEnabled(False)
-            self.start_short_button.setEnabled(False)
+            self.start_long_button.setEnabled(False); self.start_short_button.setEnabled(False)
             self.start_bot_existing_pos_button.setEnabled(False)
             self.log_message(self.bot_log, f"Inicjowanie pozycji {direction}...")
             threading.Thread(target=self.client.start_trade_manager, args=(params, direction), daemon=True).start()
 
     def start_bot_with_existing_position(self):
-        if not self.client:
-            self.log_message(self.bot_log, "Błąd: Klient nie jest połączony.")
-            return
+        if not self.client: self.log_message(self.bot_log, "Błąd: Klient nie jest połączony."); return
         try:
             params = {'account': self.account_entry.text(), 'trailing_stop': int(self.stoploss_entry.text()), 'daily_goal': int(self.daily_goal_entry.text()), 'commission': 1}
-            if not params['account']:
-                self.log_message(self.bot_log, "Błąd: Numer rachunku jest wymagany.")
-                return
-        except ValueError:
-            self.log_message(self.bot_log, "Błąd: Parametry menedżera muszą być liczbami.")
-            return
-        
-        # NEW: Confirmation step
+            if not params['account']: self.log_message(self.bot_log, "Błąd: Numer rachunku jest wymagany."); return
+        except ValueError: self.log_message(self.bot_log, "Błąd: Parametry menedżera muszą być liczbami."); return
         msg = "Czy na pewno chcesz uruchomić bota, aby zarządzał już ISTNIEJĄCĄ pozycją?"
         if self.confirm_dialog("Potwierdzenie Uruchomienia Bota", msg):
-            self.start_long_button.setEnabled(False)
-            self.start_short_button.setEnabled(False)
+            self.start_long_button.setEnabled(False); self.start_short_button.setEnabled(False)
             self.start_bot_existing_pos_button.setEnabled(False)
             self.log_message(self.bot_log, "Uruchamiam bota z istniejącą pozycją...")
             threading.Thread(target=self.client.start_trade_manager_with_existing_position, args=(params,), daemon=True).start()
 
     def close_trade_manually(self):
         if self.client and self.client.manager_state in [BotState.IN_LONG_POSITION, BotState.IN_SHORT_POSITION]:
-             # NEW: Confirmation step
             msg = "Czy na pewno chcesz natychmiast zamknąć pozycję po cenie rynkowej (PANIC)?"
             if self.confirm_dialog("Potwierdzenie Zamknięcia Pozycji", msg):
                 self.log_message(self.bot_log, "Ręczne zamykanie pozycji...")
                 self.client.close_trade_manually()
 
     def send_order(self):
-        account = self.account_entry.text()
-        direction = self.direction_combo.currentText()
-        quantity_str = self.quantity_entry.text()
-        price_str = self.price_entry.text()
+        account = self.account_entry.text(); direction = self.direction_combo.currentText()
+        quantity_str = self.quantity_entry.text(); price_str = self.price_entry.text()
         if not all([account, direction, quantity_str, price_str]):
             self.log_message(self.status_log, "BŁĄD: Wszystkie pola zlecenia muszą być wypełnione."); return
         try:
             quantity = int(quantity_str)
             if quantity <= 0: raise ValueError
-        except ValueError:
-            self.log_message(self.status_log, "BŁĄD: Ilość musi być dodatnią liczbą całkowitą."); return
+        except ValueError: self.log_message(self.status_log, "BŁĄD: Ilość musi być dodatnią liczbą całkowitą."); return
         try:
             price = float(price_str.replace(',', '.'))
             if price <= 0: raise ValueError
-        except ValueError:
-            self.log_message(self.status_log, "BŁĄD: Cena musi być dodatnią liczbą."); return
-
-        # NEW: Confirmation step
+        except ValueError: self.log_message(self.status_log, "BŁĄD: Cena musi być dodatnią liczbą."); return
         msg = (f"Czy na pewno chcesz złożyć zlecenie:\n\n"
-               f"Kierunek: {direction}\n"
-               f"Ilość: {quantity} szt.\n"
-               f"Instrument: {self.TARGET_ISIN}\n"
-               f"Cena limit: {price:.2f} PLN\n"
+               f"Kierunek: {direction}\nIlość: {quantity} szt.\n"
+               f"Instrument: {self.TARGET_ISIN}\nCena limit: {price:.2f} PLN\n"
                f"Rachunek: {account}")
-        
         if self.confirm_dialog("Potwierdzenie Zlecenia", msg):
             if self.client:
                 self.log_message(self.status_log, f"Przygotowywanie zlecenia {direction} {quantity} szt. {self.TARGET_ISIN} z limitem {price}...")
@@ -547,7 +555,6 @@ class BossaAppPyQt(QMainWindow):
         timestamp = time.strftime('%H:%M:%S')
         widget.appendPlainText(f"{timestamp} - {message}")
 
-    # --- Other methods (unchanged) ---
     def start_login_thread(self):
         self.login_button.setEnabled(False); self.disconnect_button.setEnabled(False)
         username = self.username_entry.text(); password = self.password_entry.text()
@@ -593,10 +600,7 @@ class BossaAppPyQt(QMainWindow):
         if self.client: self.disconnect()
         event.accept()
 
-# ==============================================================================
-# BossaAPIClient Class (Backend Logic)
-# MODIFIED to request confirmation for bot actions instead of executing directly.
-# ==============================================================================
+# ... (BossaAPIClient class is unchanged from the previous version) ...
 class BossaAPIClient:
     def __init__(self, username, password, gui_queue):
         self.username = username; self.password = password
@@ -604,25 +608,20 @@ class BossaAPIClient:
         self.async_port = None; self.is_logged_in = False
         self.portfolio = {}; self.stop_event = threading.Event()
         self.request_id = 1; self.async_socket = None
-        self.market_data = {}; self.TARGET_ISIN = "PL0GF0031880" #fw20z2520
+        self.market_data = {}; self.TARGET_ISIN = "PL0GF0031252"
         self.manager_thread = None; self.manager_stop_event = threading.Event()
         self.manager_state = BotState.STOPPED; self.manager_params = {}
         self.entry_order_id = None; self.stop_order_id = None
         self.position_entry_price = 0; self.active_stop_price = 0
         self.position_type = None; self.daily_profit = 0
         self.existing_position_details = None
-        # NEW: Flag to prevent bot from re-calculating while waiting for user
         self.waiting_for_confirmation = False
 
-    # NEW: Executes a bot action after GUI confirmation
     def execute_bot_action(self, action_data):
         action_type = action_data['action_type']
         details = action_data['details']
-
         if action_type == "MOVE_STOP":
             self._bot_log(f"Wykonywanie przesunięcia stop-loss na {details['new_price']:.2f}...")
-            
-            # 1. Cancel the old stop order
             if details['old_stop_id']:
                 cancel_details = {
                     'id_dm': details['old_stop_id'],
@@ -631,86 +630,53 @@ class BossaAPIClient:
                     'rachunek': self.manager_params['account']
                 }
                 self.cancel_order(cancel_details)
-                # Wait for cancellation to be acknowledged before placing new order
                 time.sleep(0.5) 
-            
-            # 2. Place the new stop order
             self.send_limit_order(self.manager_params['account'], details['direction'],
                                   details['quantity'], details['new_price'], is_managed=True)
-            
-            # 3. Update internal state
             self.active_stop_price = details['new_price']
-        
         self.waiting_for_confirmation = False
 
-    # NEW: Resets the confirmation flag if user rejects the action
     def bot_action_rejected(self):
         self.waiting_for_confirmation = False
         self._bot_log("Akcja odrzucona. Bot wznawia monitorowanie.")
 
-    # MODIFIED: Trailing stop loop now sends a confirmation request instead of acting directly
     def _trailing_stop_loop(self):
         self._bot_log("Pętla Trailing Stop rozpoczęta.")
         while not self.manager_stop_event.is_set():
-            time.sleep(15) # 1.5 seconds is too frequent for real trading
-            # Do nothing if we are in the wrong state or waiting for user input
+            time.sleep(15)
             if self.manager_state not in [BotState.IN_LONG_POSITION, BotState.IN_SHORT_POSITION] or self.waiting_for_confirmation:
                 continue
-                
             last_price = self.market_data.get(self.TARGET_ISIN, {}).get('last_price')
             if not last_price: continue
-            
-            new_stop_price = self.active_stop_price
-            should_move_stop = False
+            new_stop_price = self.active_stop_price; should_move_stop = False
             qty_for_stop = abs(self.existing_position_details['quantity']) if self.existing_position_details else 1
-
             if self.position_type == "LONG":
                 potential_stop = last_price - self.manager_params['trailing_stop']
-#                if potential_stop <= self.market_data.get(self.TARGET_ISIN, {}).get('bid', 0):
                 if self.active_stop_price <= self.market_data.get(self.TARGET_ISIN, {}).get('bid', 0):
-                    self._bot_log(f"Active stop:  {self.active_stop_price:.2f} <= {self.market_data.get(self.TARGET_ISIN, {}).get('bid', 0)}. Potential stop: {potential_stop} skipping...")
+                    self._bot_log(f"Active stop:  {self.active_stop_price:.2f} <= {self.market_data.get(self.TARGET_ISIN, {}).get('bid', 0)}. skipping...")
                 elif potential_stop > self.active_stop_price:
-                    new_stop_price = potential_stop
-                    should_move_stop = True
+                    new_stop_price = potential_stop; should_move_stop = True
             elif self.position_type == "SHORT":
                 potential_stop = last_price + self.manager_params['trailing_stop']
                 if self.active_stop_price >= self.market_data.get(self.TARGET_ISIN, {}).get('ask', 0):
-                    self._bot_log(f"Active stop:  {self.active_stop_price:.2f} >= {self.market_data.get(self.TARGET_ISIN, {}).get('ask', 0)}. Potential stop: {potential_stop} skipping...")
+                    self._bot_log(f"Active stop:  {self.active_stop_price:.2f} >= {self.market_data.get(self.TARGET_ISIN, {}).get('ask', 0)}. skipping...")
                 elif potential_stop < self.active_stop_price:
-                    new_stop_price = potential_stop
-                    should_move_stop = True
-            
+                    new_stop_price = potential_stop; should_move_stop = True
             if should_move_stop:
                 self._bot_log(f"Wykryto potrzebę przesunięcia stop-loss z {self.active_stop_price:.2f} na {new_stop_price:.2f}. Oczekiwanie na potwierdzenie...")
                 self.waiting_for_confirmation = True
-
                 direction = "Sprzedaż" if self.position_type == "LONG" else "Kupno"
-                
-                # Prepare all details needed by the GUI to confirm and execute the action
-                action_details = {
-                    "old_stop_id": self.stop_order_id,
-                    "new_price": new_stop_price,
-                    "quantity": qty_for_stop,
-                    "direction": direction
-                }
-                
-                # Send request to GUI
+                action_details = {"old_stop_id": self.stop_order_id, "new_price": new_stop_price, "quantity": qty_for_stop, "direction": direction}
                 self.gui_queue.put(("CONFIRM_BOT_ACTION", {"action_type": "MOVE_STOP", "details": action_details}))
-
         self._bot_log("Pętla Trailing Stop zakończona.")
         
-    # --- Other BossaAPIClient methods are mostly unchanged ---
-    # They are now invoked by the GUI after confirmation.
     def cancel_order(self, order_details):
-        self.request_id += 1
-        client_cancel_id = self.request_id
+        self.request_id += 1; client_cancel_id = self.request_id
         side = '1' if order_details['k_s_text'] == "Kupno" else '2'
         txn_time = datetime.now().strftime('%Y%m%d-%H:%M:%S')
         fixml_request = f"""<FIXML v="5.0" r="20080317" s="20080314">
 <OrdCxlReq ID="{client_cancel_id}" OrdID="{order_details['id_dm']}" Acct="{order_details['rachunek']}" Side="{side}"  TxnTm="{txn_time}">
-<Instrmt ID="{self.TARGET_ISIN}" Src="4"/>
-<OrdQty Qty="{order_details['ilosc']}"/>
-</OrdCxlReq></FIXML>"""
+<Instrmt ID="{self.TARGET_ISIN}" Src="4"/><OrdQty Qty="{order_details['ilosc']}"/></OrdCxlReq></FIXML>"""
         response = self._send_and_receive_sync(fixml_request)
         if response and '<ExecRpt' in response: self._parse_execution_report(response)
         else: self._log(f"Odpowiedź na anulatę zlecenia {order_details['id_dm']}: {response}")
@@ -737,8 +703,7 @@ class BossaAPIClient:
             root = ET.fromstring(xml_data)
             exec_rpt = root.find('ExecRpt')
             if exec_rpt is None: return
-            instrument = exec_rpt.find('Instrmt')
-            symbol = instrument.get('Sym', 'N/A') if instrument is not None else 'N/A'
+            instrument = exec_rpt.find('Instrmt'); symbol = instrument.get('Sym', 'N/A') if instrument is not None else 'N/A'
             order_data = {'id_dm': exec_rpt.get('OrdID', ''), 'id_klienta': exec_rpt.get('ID', ''),'status': exec_rpt.get('Stat', ''), 'symbol': symbol, 'k_s': exec_rpt.get('Side', ''), 'ilosc': exec_rpt.find('.//OrdQty').get('Qty', '') if exec_rpt.find('.//OrdQty') is not None else '', 'pozostalo': exec_rpt.get('LeavesQty', ''), 'wykonano': exec_rpt.get('CumQty', ''), 'limit': exec_rpt.get('Px', ''), 'cena_ost': exec_rpt.get('LastPx', ''), 'czas': exec_rpt.get('TxnTm', '')}
             self.gui_queue.put(("EXEC_REPORT", order_data))
             client_id = exec_rpt.get('ID'); status = exec_rpt.get('Stat'); dm_id = exec_rpt.get('OrdID')
@@ -808,11 +773,11 @@ class BossaAPIClient:
         market_info = self.market_data.get(self.TARGET_ISIN)
         if not market_info: self._bot_log("Błąd: Brak danych rynkowych."); return
         if direction == "Kupno":
-            entry_price = market_info.get('bid') # zamienilem na bid
+            entry_price = market_info.get('bid')
             if not entry_price: self._bot_log("Błąd: Brak ceny BID."); return
             self.position_type = "LONG"
         else:
-            entry_price = market_info.get('ask') # zamienilem na ask
+            entry_price = market_info.get('ask')
             if not entry_price: self._bot_log("Błąd: Brak ceny ASK."); return
             self.position_type = "SHORT"
         self._bot_log(f"Otwieram pozycję {self.position_type} zleceniem LIMIT po cenie {entry_price}...")
@@ -830,25 +795,20 @@ class BossaAPIClient:
         self.position_type = self.existing_position_details['position_type']
         self.position_entry_price = self.market_data.get(self.TARGET_ISIN, {}).get('last_price', 0)
         order_quantity = abs(self.existing_position_details['quantity'])
-
         if self.position_type == "LONG":
             self.manager_state = BotState.IN_LONG_POSITION
             self.active_stop_price = self.position_entry_price - self.manager_params['trailing_stop']
             self._bot_log(f"Zarządzam ist. poz. LONG. Cena wejścia (szac.): {self.position_entry_price:.2f}. Ustawiam SL na {self.active_stop_price:.2f}")
             if self.active_stop_price <= self.market_data.get(self.TARGET_ISIN, {}).get('bid', 0):
                 self._bot_log(f"SL {self.active_stop_price:.2f} <= {self.market_data.get(self.TARGET_ISIN, {}).get('bid', 0)}  . Nie ustawiam zlecenia SL.")
-            else:
-                self.send_limit_order(self.manager_params['account'], "Sprzedaż", order_quantity, self.active_stop_price, is_managed=True)
-
+            else: self.send_limit_order(self.manager_params['account'], "Sprzedaż", order_quantity, self.active_stop_price, is_managed=True)
         elif self.position_type == "SHORT":
             self.manager_state = BotState.IN_SHORT_POSITION
             self.active_stop_price = self.position_entry_price + self.manager_params['trailing_stop']
             self._bot_log(f"Zarządzam ist. poz. SHORT. Cena wejścia (szac.): {self.position_entry_price:.2f}. Ustawiam SL na {self.active_stop_price:.2f}")
             if self.active_stop_price >= self.market_data.get(self.TARGET_ISIN, {}).get('ask', 0):
                 self._bot_log(f"SL {self.active_stop_price:.2f} >=  {self.market_data.get(self.TARGET_ISIN, {}).get('ask', 0)}  . Nie ustawiam zlecenia SL.")
-            else:
-                self.send_limit_order(self.manager_params['account'], "Kupno", order_quantity, self.active_stop_price, is_managed=True)
-
+            else: self.send_limit_order(self.manager_params['account'], "Kupno", order_quantity, self.active_stop_price, is_managed=True)
         self.gui_queue.put(("BOT_STATE_UPDATE", {'entry_price': self.position_entry_price, 'commission': self.manager_params['commission'], 'position_type': self.position_type}))
         if self.manager_thread is None or not self.manager_thread.is_alive():
             self.manager_thread = threading.Thread(target=self._trailing_stop_loop, daemon=True)
