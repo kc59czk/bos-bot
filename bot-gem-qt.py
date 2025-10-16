@@ -9,12 +9,14 @@ import time
 from datetime import datetime
 from enum import Enum
 import re
+import os
+import random
 
 # PyQt6 imports
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QLineEdit, QPushButton, QTabWidget, QTreeWidget, QTreeWidgetItem, QTextEdit,
-    QComboBox, QFrame, QMessageBox, QHeaderView, QSplitter, QPlainTextEdit
+    QComboBox, QFrame, QMessageBox, QHeaderView, QSplitter, QPlainTextEdit,QGroupBox,QCheckBox,QFileDialog
 )
 from PyQt6.QtCore import QTimer, Qt
 from PyQt6.QtGui import QFont
@@ -62,6 +64,7 @@ class BossaAppPyQt(QMainWindow):
         self.create_monitor_tab()
         self.create_bot_tab()
         self.create_portfolio_tab()
+        self.create_charts_tab()  # New Charts tab
         bottom_logs_splitter = QSplitter(Qt.Orientation.Vertical)
         top_panel_widget = QWidget()
         top_panel_layout = QVBoxLayout(top_panel_widget)
@@ -289,6 +292,229 @@ class BossaAppPyQt(QMainWindow):
         layout.addWidget(self.portfolio_display)
         self.tabs.addTab(tab_portfolio, "Portfel")
 
+
+#============================================
+    def create_charts_tab(self):
+        """Create the lightweight charts tab"""
+        charts_tab = QWidget()
+        charts_layout = QVBoxLayout(charts_tab)
+        
+        # Chart selection controls
+        control_widget = QWidget()
+        control_layout = QHBoxLayout(control_widget)
+        
+        # Symbol selection
+        control_layout.addWidget(QLabel("Symbol:"))
+        self.chart_symbol_input = QLineEdit("FW20Z2520")
+        control_layout.addWidget(self.chart_symbol_input)
+        
+        # Timeframe selection
+        control_layout.addWidget(QLabel("Timeframe:"))
+        self.timeframe_combo = QComboBox()
+        self.timeframe_combo.addItems(["Tick", "1m", "5m", "15m", "30m", "1h", "4h", "1d"])
+        control_layout.addWidget(self.timeframe_combo)
+        
+        # Data file selection
+        control_layout.addWidget(QLabel("Data File:"))
+        self.data_file_input = QLineEdit("historical_data.csv")
+        control_layout.addWidget(self.data_file_input)
+        self.browse_file_button = QPushButton("Browse...")
+        self.browse_file_button.clicked.connect(self.browse_data_file)
+        control_layout.addWidget(self.browse_file_button)
+        
+        # Load chart button
+        self.load_chart_button = QPushButton("Load Historical Data")
+        self.load_chart_button.clicked.connect(self.load_historical_data)
+        control_layout.addWidget(self.load_chart_button)
+        
+        # Start live update button
+        self.start_live_button = QPushButton("Start Live Updates")
+        self.start_live_button.clicked.connect(self.start_live_updates)
+        self.start_live_button.setEnabled(False)
+        control_layout.addWidget(self.start_live_button)
+        
+        control_layout.addStretch()
+        charts_layout.addWidget(control_widget)
+        
+        # Chart container
+        chart_container = QWidget()
+        chart_layout = QVBoxLayout(chart_container)
+        
+        # Placeholder for the chart - you'll integrate lightweight-charts here
+        self.chart_widget = QWidget()
+        self.chart_widget.setMinimumSize(800, 500)
+        self.chart_widget.setStyleSheet("background-color: #f8f8f8; border: 1px solid #ccc;")
+        
+        # Placeholder label
+        placeholder_label = QLabel("Lightweight Charts will be displayed here\nHistorical data will be loaded from file")
+        placeholder_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        placeholder_layout = QVBoxLayout(self.chart_widget)
+        placeholder_layout.addWidget(placeholder_label)
+        
+        chart_layout.addWidget(self.chart_widget)
+        charts_layout.addWidget(chart_container)
+        
+        # Status label for chart
+        self.chart_status_label = QLabel("Ready to load historical data")
+        charts_layout.addWidget(self.chart_status_label)
+        
+        # Add indicators/studies section
+        indicators_group = QGroupBox("Indicators")
+        indicators_layout = QHBoxLayout(indicators_group)
+        
+        self.sma_checkbox = QCheckBox("SMA")
+        self.ema_checkbox = QCheckBox("EMA")
+        self.rsi_checkbox = QCheckBox("RSI")
+        self.macd_checkbox = QCheckBox("MACD")
+        
+        indicators_layout.addWidget(self.sma_checkbox)
+        indicators_layout.addWidget(self.ema_checkbox)
+        indicators_layout.addWidget(self.rsi_checkbox)
+        indicators_layout.addWidget(self.macd_checkbox)
+        indicators_layout.addStretch()
+        
+        charts_layout.addWidget(indicators_group)
+        
+        self.tabs.addTab(charts_tab, "Charts")
+        
+        # Initialize chart data storage
+        self.chart_data = []
+        self.current_symbol = ""
+        self.live_update_timer = QTimer(self)
+        self.live_update_timer.timeout.connect(self.update_live_data)
+
+      #  self.tabs.addTab(charts_tab, "Wykres")
+
+    def browse_data_file(self):
+        """Open file dialog to select data file"""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "Select Historical Data File", "", "CSV Files (*.csv);;All Files (*)"
+        )
+        if file_path:
+            self.data_file_input.setText(file_path)
+
+    def load_historical_data(self):
+        """Load historical data from file and initialize chart"""
+        try:
+            file_path = self.data_file_input.text()
+            symbol = self.chart_symbol_input.text()
+            timeframe = self.timeframe_combo.currentText()
+            
+            if not os.path.exists(file_path):
+                self.chart_status_label.setText(f"Error: File not found - {file_path}")
+                return
+            
+            # Read and parse historical data
+            self.chart_data = self.parse_historical_data(file_path, symbol)
+            
+            if not self.chart_data:
+                self.chart_status_label.setText("No data found for the specified symbol")
+                return
+            
+            self.current_symbol = symbol
+            self.chart_status_label.setText(f"Loaded {len(self.chart_data)} records for {symbol}")
+            
+            # Initialize chart with historical data
+            self.initialize_chart(self.chart_data, timeframe)
+            
+            # Enable live updates
+            self.start_live_button.setEnabled(True)
+            self.load_chart_button.setEnabled(False)
+            
+        except Exception as e:
+            self.chart_status_label.setText(f"Error loading data: {str(e)}")
+
+    def parse_historical_data(self, file_path, symbol):
+        """Parse historical data from CSV file"""
+        data = []
+        try:
+            with open(file_path, 'r') as file:
+                # Skip header
+                next(file)
+                
+                for line in file:
+                    parts = line.strip().split(',')
+                    if len(parts) >= 11 and parts[0] == symbol:
+                        try:
+                            # Parse the data according to your format
+                            bar_data = {
+                                'time': int(float(parts[3])),  # _quote_date_tms as timestamp
+                                'open': float(parts[4]),       # _quote_open
+                                'high': float(parts[5]),       # _quote_max
+                                'low': float(parts[6]),        # _quote_min
+                                'close': float(parts[7]),      # _quote
+                                'volume': float(parts[8])      # _volume
+                            }
+                            data.append(bar_data)
+                        except ValueError:
+                            continue  # Skip invalid lines
+            
+            # Sort by timestamp
+            data.sort(key=lambda x: x['time'])
+            
+        except Exception as e:
+            self.status_log.appendPlainText(f"Error parsing historical data: {str(e)}")
+        
+        return data
+
+    def initialize_chart(self, data, timeframe):
+        """Initialize the chart with historical data"""
+        # This is where you'll integrate with lightweight-charts-python
+        # For now, just display the data summary
+        self.status_log.appendPlainText(
+            f"Chart initialized with {len(data)} bars for {self.current_symbol} "
+            f"({timeframe}) from {datetime.fromtimestamp(data[0]['time'])} to "
+            f"{datetime.fromtimestamp(data[-1]['time'])}"
+        )
+        
+        # TODO: Replace with actual lightweight-charts integration
+        # Example: self.chart.set(data)
+        
+        # Update placeholder with data summary
+        if hasattr(self, 'chart_widget'):
+            for i in reversed(range(self.chart_widget.layout().count())): 
+                self.chart_widget.layout().itemAt(i).widget().setParent(None)
+            
+            summary_label = QLabel(
+                f"Historical Data Loaded:\n"
+                f"Symbol: {self.current_symbol}\n"
+                f"Timeframe: {timeframe}\n"
+                f"Bars: {len(data)}\n"
+                f"Date Range: {datetime.fromtimestamp(data[0]['time'])} - {datetime.fromtimestamp(data[-1]['time'])}\n"
+                f"Price Range: {min(d['low'] for d in data):.2f} - {max(d['high'] for d in data):.2f}"
+            )
+            summary_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.chart_widget.layout().addWidget(summary_label)
+
+    def start_live_updates(self):
+        """Start receiving live market data updates"""
+        self.chart_status_label.setText("Live updates started - waiting for market data...")
+        self.start_live_button.setEnabled(False)
+        
+        # Simulate live updates (replace with your actual market data connection)
+        self.live_update_timer.start(1000)  # Update every second
+
+    def update_live_data(self):
+        """Update chart with new live market data"""
+        # This would be called when new market data arrives
+        # For demonstration, we'll simulate some data
+        if self.chart_data:
+            last_bar = self.chart_data[-1].copy()
+            last_bar['time'] = int(time.time())  # Current timestamp
+            last_bar['close'] = last_bar['close'] * (1 + (random.random() - 0.5) * 0.01)  # Random price change
+            last_bar['high'] = max(last_bar['high'], last_bar['close'])
+            last_bar['low'] = min(last_bar['low'], last_bar['close'])
+            last_bar['volume'] = random.randint(1, 10)
+            
+            self.chart_data.append(last_bar)
+            
+            # Update chart with new data
+            # TODO: Replace with actual lightweight-charts update
+            self.status_log.appendPlainText(
+                f"Live update: {datetime.fromtimestamp(last_bar['time'])} - "
+                f"Price: {last_bar['close']:.2f}, Volume: {last_bar['volume']}"
+            )
+#============================================
     # --- Confirmation and Action Handlers ---
 
     def confirm_dialog(self, title, message):
