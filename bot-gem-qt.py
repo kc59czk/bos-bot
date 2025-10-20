@@ -561,11 +561,7 @@ class BossaAppPyQt(QMainWindow):
     def _flash_heartbeat(self):
         self.heartbeat_label.setText("❤")
         QTimer.singleShot(300, lambda: self.heartbeat_label.setText("♡"))
-    def format_value(value):
-        if isinstance(value, (int, float)):
-            return f"{value:.2f}"
-        return str(value)
-    
+
     def process_queue(self):
         try:
             while not self.queue.empty():
