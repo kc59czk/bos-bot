@@ -561,6 +561,10 @@ class BossaAppPyQt(QMainWindow):
     def _flash_heartbeat(self):
         self.heartbeat_label.setText("❤")
         QTimer.singleShot(300, lambda: self.heartbeat_label.setText("♡"))
+    def format_value(value):
+        if isinstance(value, (int, float)):
+            return f"{value:.2f}"
+        return str(value)
     
     def process_queue(self):
         try:
@@ -583,8 +587,23 @@ class BossaAppPyQt(QMainWindow):
 
                 elif message_type == "MARKET_DATA_UPDATE":
                     if data.get('isin') == self.TARGET_ISIN:
-                        self.bid_label.setText(f"{data.get('bid', '---'):.2f}")
-                        self.ask_label.setText(f"{data.get('ask', '---'):.2f}")
+                            # Handle bid value
+                        bid_value = data.get('bid', '---')
+                        if isinstance(bid_value, (int, float)):
+                            self.bid_label.setText(f"{bid_value:.2f}")
+                        else:
+                            self.bid_label.setText(str(bid_value))
+                        
+                        # Handle ask value
+                        ask_value = data.get('ask', '---')
+                        if isinstance(ask_value, (int, float)):
+                            self.ask_label.setText(f"{ask_value:.2f}")
+                        else:
+                            self.ask_label.setText(str(ask_value))
+                    #    self.bid_label.setText(self.format_value(data.get('bid', '---')))
+                    #    self.ask_label.setText(self.format_value(data.get('ask', '---')))
+                    #    self.bid_label.setText(f"{data.get('bid', '---'):.2f}")
+                    #    self.ask_label.setText(f"{data.get('ask', '---'):.2f}")
                         self.last_label.setText(f"{data.get('last_price', '---'):.2f}")
                         self.lop_label.setText(f"{data.get('lop', '---')}")
                         self.bid_size_label.setText(str(data.get('bid_size', '---')))
