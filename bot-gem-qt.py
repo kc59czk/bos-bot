@@ -1,17 +1,12 @@
 import sys
-import threading
 import queue
-import socket
-import struct
-import winreg
-import xml.etree.ElementTree as ET
+import threading
 import time
 from datetime import datetime
-from enum import Enum
 import re
 import os
 import random
-
+import xml.etree.ElementTree as ET
 # PyQt6 imports
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
@@ -21,12 +16,8 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import QTimer, Qt
 from PyQt6.QtGui import QFont
 
-class BotState(Enum):
-    STOPPED = 0
-    IDLE = 1
-    WAITING_FOR_ENTRY_FILL = 2
-    IN_LONG_POSITION = 3
-    IN_SHORT_POSITION = 4
+from core.client import BossaAPIClient, BotState
+from gui.charts_tab import ChartsTab
 
 class BossaAppPyQt(QMainWindow):
     def __init__(self):
@@ -56,7 +47,7 @@ class BossaAppPyQt(QMainWindow):
     def create_widgets(self):
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
-        main_layout = QHBoxLayout(central_widget)  # can chage to QVBoxLayout
+        main_layout = QHBoxLayout(central_widget)
         self.tabs = QTabWidget()
         main_layout.addWidget(self.tabs)
         self.create_login_tab()
@@ -64,7 +55,11 @@ class BossaAppPyQt(QMainWindow):
         self.create_monitor_tab()
         self.create_bot_tab()
         self.create_portfolio_tab()
-        self.create_charts_tab()  # New Charts tab
+
+        # use ChartsTab from gui package
+        self.charts_tab = ChartsTab(self)
+        self.tabs.addTab(self.charts_tab, "Charts")
+        
         bottom_logs_splitter = QSplitter(Qt.Orientation.Vertical)
         top_panel_widget = QWidget()
         top_panel_layout = QVBoxLayout(top_panel_widget)
